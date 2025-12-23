@@ -17,7 +17,7 @@ def fetch_data(url, token=None):
 
 @st.cache_data(ttl=3600)
 def get_all_market_data(token=None):
-    """Busca a lista de ativos disponíveis na B3."""
+    """Busca a lista de ativos disponíveis na B3 com tratamento de erros."""
     try:
         url = "https://brapi.dev/api/quote/list"
         response = fetch_data(url, token)
@@ -45,25 +45,36 @@ if MARKET_DATA_DF.empty:
         st.error("⚠️ Erro ao carregar dados. Verifique seu Token.")
     st.stop()
 
-def analisar_ativo(ticker, criterios, tipo_ativo, token):
-    """Analisa o ativo usando apenas o módulo 'fundamental' (compatível com plano gratuito)."""
+def analisar_ativo(ticker, criterios, tipo_ativo, token, metadata_df):
+    """Analisa o ativo com alta resiliência para evitar 'Dados Insuficientes'."""
     try:
-        # Otimizado para plano gratuito: removido 'balanceSheetHistory' que causa erro 403
+        # Tenta buscar dados fundamentalistas
         url = f"https://brapi.dev/api/quote/{ticker}?fundamental=true&range=1mo&interval=1d"
         response = fetch_data(url, token)
         
         if response.status_code == 403:
-            return {"Ativo": ticker, "Status": "Erro 403: Plano não permite este dado", "Setor": "N/A"}
+            return {"Ativo": ticker, "Status": "Erro 403: Plano Restrito", "Setor": "N/A"}
         if response.status_code == 401:
             return {"Ativo": ticker, "Status": "Erro 401: Token Inválido", "Setor": "N/A"}
             
         response.raise_for_status()
         data = response.json()["results"][0]
         
-        nome = data.get("longName", ticker)
-        setor = data.get("sector", "N/A")
-        chart_data = data.get("historicalDataPrice")
+        # Resiliência no Nome e Setor: Tenta pegar da API, se não der, pega do MARKET_DATA_DF
+        nome = data.get("longName") or data.get("shortName")
+        setor = data.get("sector")
         
+        if not nome or nome == "N/A":
+            meta = metadata_df[metadata_df['stock'] == ticker]
+            if not meta.empty:
+                nome = meta.iloc[0]['name']
+                if not setor or setor == "N/A":
+                    setor = meta.iloc[0]['sector']
+        
+        nome = nome if nome and str(nome) != "nan" else ticker
+        setor = setor if setor and str(setor) != "nan" else "N/A"
+        
+        chart_data = data.get("historicalDataPrice")
         res = {"Ativo": ticker, "Nome": nome, "Setor": setor, "ChartData": chart_data}
         
         if tipo_ativo == 'stock':
@@ -72,25 +83,41 @@ def analisar_ativo(ticker, criterios, tipo_ativo, token):
             roe = data.get("returnOnEquity")
             roic = data.get("returnOnInvestedCapital")
             
-            if p_l is None or p_vp is None:
+            # Se P/L e P/VP faltarem, não há como analisar valor
+            if p_l is None and p_vp is None:
                 res["Status"] = "Dados Insuficientes"
                 return res
 
-            # Análise baseada nos critérios disponíveis no plano gratuito
-            passou = (p_l <= criterios["P/L_MAX"]) and (p_vp <= criterios["P/VP_MAX"]) and \
-                     (roe is not None and roe >= criterios["ROE_MIN"]) and \
-                     (roic is not None and roic >= criterios["ROIC_MIN"])
+            # Lógica flexível: Se um indicador faltar, ele não reprova automaticamente, 
+            # mas os que existem devem passar nos critérios.
+            passou_valor = True
+            if p_l is not None and p_l > criterios["P/L_MAX"]: passou_valor = False
+            if p_vp is not None and p_vp > criterios["P/VP_MAX"]: passou_valor = False
             
-            res["Status"] = "Aprovada ✅" if passou else "Reprovada ❌"
+            passou_rentabilidade = True
+            if roe is not None and roe < criterios["ROE_MIN"]: passou_rentabilidade = False
+            if roic is not None and roic < criterios["ROIC_MIN"]: passou_rentabilidade = False
+            
+            # Garantir que ao menos um indicador de cada categoria exista
+            if (p_l is None and p_vp is None) or (roe is None and roic is None):
+                res["Status"] = "Dados Parciais"
+            else:
+                res["Status"] = "Aprovada ✅" if passou_valor and passou_rentabilidade else "Reprovada ❌"
+            
             res.update({"P/L": p_l, "P/VP": p_vp, "ROE (%)": roe, "ROIC (%)": roic})
             
         elif tipo_ativo == 'fund':
             p_vp = data.get("priceToBook")
             dy = data.get("dividendYield")
-            if p_vp is None or dy is None:
+            
+            if p_vp is None and dy is None:
                 res["Status"] = "Dados Insuficientes"
                 return res
-            passou = (p_vp <= criterios["P/VP_MAX_FII"]) and (dy >= criterios["DY_MIN_FII"])
+                
+            passou = True
+            if p_vp is not None and p_vp > criterios["P/VP_MAX_FII"]: passou = False
+            if dy is not None and dy < criterios["DY_MIN_FII"]: passou = False
+            
             res["Status"] = "Aprovada ✅" if passou else "Reprovada ❌"
             res.update({"P/VP": p_vp, "Dividend Yield (%)": dy})
             
@@ -107,14 +134,15 @@ tipos = sorted(MARKET_DATA_DF['type'].unique().tolist())
 tipo_sel = st.sidebar.selectbox("Tipo", options=tipos, index=tipos.index("stock") if "stock" in tipos else 0)
 
 df_t = MARKET_DATA_DF[MARKET_DATA_DF['type'] == tipo_sel]
-setores = ["Todos"] + sorted([s for s in df_t['sector'].unique().tolist() if s and s != "N/A"])
+setores = ["Todos"] + sorted([s for s in df_t['sector'].unique().tolist() if s and s != "N/A" and s != "nan"])
 setor_sel = st.sidebar.selectbox("Setor", options=setores)
 
 df_f = df_t.copy()
 if setor_sel != "Todos": df_f = df_f[df_f['sector'] == setor_sel]
 
-acoes_sel = st.sidebar.multiselect("Ativos", options=sorted(df_f['stock'].unique().tolist()), 
-                                  default=sorted(df_f['stock'].unique().tolist())[:5] if setor_sel == "Todos" else sorted(df_f['stock'].unique().tolist()))
+lista_final = sorted(df_f['stock'].unique().tolist())
+acoes_sel = st.sidebar.multiselect("Ativos", options=lista_final, 
+                                  default=lista_final[:5] if setor_sel == "Todos" and len(lista_final) > 5 else lista_final)
 
 st.sidebar.header("2. Critérios")
 crit = {}
@@ -136,7 +164,7 @@ if st.button("▶️ Iniciar Análise"):
         res_list = []
         bar = st.progress(0)
         for i, t in enumerate(acoes_sel):
-            res_list.append(analisar_ativo(t, crit, tipo_sel, api_token))
+            res_list.append(analisar_ativo(t, crit, tipo_sel, api_token, MARKET_DATA_DF))
             bar.progress((i + 1) / len(acoes_sel))
             time.sleep(0.2)
         
@@ -149,12 +177,13 @@ if st.button("▶️ Iniciar Análise"):
         st.dataframe(df_res[[c for c in cols if c in df_res.columns]].style.format(precision=2, na_rep="-"), use_container_width=True)
         
         st.subheader("Gráficos (Aprovados)")
-        aprov = df_res[df_res['Status'] == 'Aprovada ✅']
-        for _, r in aprov.iterrows():
-            with st.expander(f"📊 {r['Ativo']} - {r['Nome']}"):
-                if r.get('ChartData'):
-                    df_c = pd.DataFrame(r['ChartData'])
-                    df_c['date'] = pd.to_datetime(df_c['date'], unit='s')
-                    fig = go.Figure(data=[go.Scatter(x=df_c['date'], y=df_c['close'], mode='lines', name='Preço')])
-                    fig.update_layout(template='plotly_dark', margin=dict(l=10, r=10, t=10, b=10))
-                    st.plotly_chart(fig, use_container_width=True)
+        if "Status" in df_res.columns:
+            aprov = df_res[df_res['Status'] == 'Aprovada ✅']
+            for _, r in aprov.iterrows():
+                with st.expander(f"📊 {r['Ativo']} - {r['Nome']}"):
+                    if r.get('ChartData'):
+                        df_c = pd.DataFrame(r['ChartData'])
+                        df_c['date'] = pd.to_datetime(df_c['date'], unit='s')
+                        fig = go.Figure(data=[go.Scatter(x=df_c['date'], y=df_c['close'], mode='lines', name='Preço')])
+                        fig.update_layout(template='plotly_dark', margin=dict(l=10, r=10, t=10, b=10))
+                        st.plotly_chart(fig, use_container_width=True)
