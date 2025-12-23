@@ -18,11 +18,16 @@ def get_all_market_data():
         data = response.json().get('stocks', [])
         if not data:
             return pd.DataFrame(columns=['stock', 'name', 'sector', 'type'])
+        
         df = pd.DataFrame(data)
-        # Garantir que as colunas existam
+        
+        # Garantir que as colunas existam e preencher nulos com "N/A"
         for col in ['stock', 'name', 'sector', 'type']:
             if col not in df.columns:
                 df[col] = "N/A"
+            else:
+                df[col] = df[col].fillna("N/A").astype(str)
+        
         return df[['stock', 'name', 'sector', 'type']]
     except Exception as e:
         return pd.DataFrame(columns=['stock', 'name', 'sector', 'type'])
@@ -118,19 +123,23 @@ def criar_grafico_comparativo(df_performance, periodo_nome):
 # --- INTERFACE STREAMLIT ---
 
 st.sidebar.header("1. Seleção de Ativos")
-tipo_selecionado = st.sidebar.selectbox("Tipo de Ativo", options=["Ações (stock)", "FIIs (fund)"])
-tipo_key = "stock" if "stock" in tipo_selecionado else "fund"
 
-# Proteção contra DataFrame vazio na filtragem de setores
+# Limpeza e preparação de tipos
+tipos_disponiveis = sorted(MARKET_DATA_DF['type'].unique().tolist())
+tipo_selecionado = st.sidebar.selectbox("Tipo de Ativo", options=tipos_disponiveis, index=tipos_disponiveis.index("stock") if "stock" in tipos_disponiveis else 0)
+tipo_key = tipo_selecionado
+
+# Filtragem segura de setores
 df_tipo = MARKET_DATA_DF[MARKET_DATA_DF['type'] == tipo_key]
-lista_setores = ["Todos"] + sorted(df_tipo['sector'].unique().tolist()) if not df_tipo.empty else ["Todos"]
+setores_unicos = [s for s in df_tipo['sector'].unique().tolist() if s and s != "nan" and s != "N/A"]
+lista_setores = ["Todos"] + sorted(setores_unicos)
 setor_selecionado = st.sidebar.selectbox("Filtrar por Setor", options=lista_setores)
 
 df_filtrado = df_tipo.copy()
-if setor_selecionado != "Todos" and not df_filtrado.empty:
+if setor_selecionado != "Todos":
     df_filtrado = df_filtrado[df_filtrado['sector'] == setor_selecionado]
 
-lista_acoes_disponiveis = sorted(df_filtrado['stock'].unique().tolist()) if not df_filtrado.empty else []
+lista_acoes_disponiveis = sorted(df_filtrado['stock'].unique().tolist())
 
 acoes_selecionadas = st.sidebar.multiselect(
     "Selecione os Ativos", 
@@ -158,7 +167,7 @@ dias_map = {"1 Ano": 365, "2 Anos": 730, "5 Anos": 1825}
 
 # --- EXECUÇÃO ---
 
-st.title(f"🤖 Agente de Análise e Backtesting: {'Ações' if tipo_key == 'stock' else 'FIIs'}")
+st.title(f"🤖 Agente de Análise e Backtesting: {tipo_key.upper()}")
 
 tab1, tab2 = st.tabs(["🔍 Análise Atual", "📈 Backtesting de Performance"])
 
@@ -182,13 +191,14 @@ with tab1:
     if 'df_res' in st.session_state:
         df_res = st.session_state.df_res
         st.subheader("Resultados da Estratégia")
+        
+        # Colunas dinâmicas baseadas no tipo
         cols_to_show = ["Ativo", "Nome", "Setor", "Status", "P/VP"]
         if tipo_key == "stock":
             cols_to_show += ["P/L", "ROE (%)", "ROIC (%)", "PEG Ratio"]
         else:
             cols_to_show += ["Dividend Yield (%)"]
         
-        # Filtrar colunas que realmente existem no DataFrame
         cols_existentes = [c for c in cols_to_show if c in df_res.columns]
         st.dataframe(df_res[cols_existentes].style.format(precision=2, na_rep="-"), use_container_width=True)
         
@@ -212,8 +222,6 @@ with tab1:
 
 with tab2:
     st.subheader("Simulação: Como as ações aprovadas hoje renderam no passado?")
-    st.info("Esta simulação calcula o retorno acumulado das ações que passaram nos seus critérios hoje, comparando-as com o IBOVESPA no período selecionado.")
-    
     if 'df_res' not in st.session_state:
         st.warning("Primeiro, execute a 'Análise Atual' na primeira aba.")
     else:
@@ -224,21 +232,18 @@ with tab2:
                 st.error("Não há ações aprovadas para realizar o backtesting.")
             else:
                 if st.button("🚀 Rodar Simulação Histórica"):
-                    with st.spinner("Buscando dados históricos e calculando retornos..."):
+                    with st.spinner("Buscando dados históricos..."):
                         try:
-                            # Busca dados do IBOVESPA para comparação
                             res_ibov = requests.get("https://brapi.dev/api/quote/%5EBVSP?range=5y&interval=1d").json()["results"][0]
                             df_ibov = pd.DataFrame(res_ibov["historicalDataPrice"])
                             df_ibov['date'] = pd.to_datetime(df_ibov['date'], unit='s')
                             df_ibov.set_index('date', inplace=True)
                             
-                            # Filtra o período
                             data_inicio = datetime.now() - timedelta(days=dias_map[periodo_backtest])
                             df_ibov = df_ibov[df_ibov.index >= data_inicio]
                             ibov_inicio = df_ibov['close'].iloc[0]
                             df_ibov['IBOVESPA (%)'] = (df_ibov['close'] / ibov_inicio - 1) * 100
                             
-                            # Calcula performance da carteira (média das ações aprovadas)
                             performances = []
                             for _, row in aprovados.iterrows():
                                 if row.get('ChartData'):
@@ -255,20 +260,12 @@ with tab2:
                                 df_final = pd.concat(performances, axis=1).fillna(method='ffill')
                                 df_final['SUA CARTEIRA (%)'] = df_final.mean(axis=1)
                                 df_final = df_final.join(df_ibov['IBOVESPA (%)'], how='inner')
-                                
-                                # Exibe Gráfico
                                 st.plotly_chart(criar_grafico_comparativo(df_final[['SUA CARTEIRA (%)', 'IBOVESPA (%)']], periodo_backtest), use_container_width=True)
-                                
-                                # Métricas Finais
                                 c1, c2, c3 = st.columns(3)
-                                ret_cart = df_final['SUA CARTEIRA (%)'].iloc[-1]
-                                ret_ibov = df_final['IBOVESPA (%)'].iloc[-1]
-                                c1.metric("Retorno da Carteira", f"{ret_cart:.2f}%")
-                                c2.metric("Retorno IBOVESPA", f"{ret_ibov:.2f}%")
-                                c3.metric("Alpha (Diferença)", f"{ret_cart - ret_ibov:.2f}%", delta=f"{ret_cart - ret_ibov:.2f}%")
+                                c1.metric("Retorno da Carteira", f"{df_final['SUA CARTEIRA (%)'].iloc[-1]:.2f}%")
+                                c2.metric("Retorno IBOVESPA", f"{df_final['IBOVESPA (%)'].iloc[-1]:.2f}%")
+                                c3.metric("Alpha", f"{df_final['SUA CARTEIRA (%)'].iloc[-1] - df_final['IBOVESPA (%)'].iloc[-1]:.2f}%")
                             else:
-                                st.error("Dados históricos insuficientes para o período selecionado.")
+                                st.error("Dados históricos insuficientes.")
                         except Exception as e:
-                            st.error(f"Erro ao processar simulação: {e}")
-        else:
-            st.error("Execute a análise na aba anterior primeiro.")
+                            st.error(f"Erro: {e}")
