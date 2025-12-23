@@ -45,16 +45,15 @@ if MARKET_DATA_DF.empty:
         st.error("⚠️ Erro ao carregar dados. Verifique seu Token.")
     st.stop()
 
-def calcular_cagr(valor_inicial, valor_final, periodos):
-    if valor_inicial is None or valor_final is None or valor_inicial <= 0 or periodos <= 0: return None
-    return ((valor_final / valor_inicial) ** (1 / periodos)) - 1
-
 def analisar_ativo(ticker, criterios, tipo_ativo, token):
-    """Analisa o ativo usando o token para evitar erro 401."""
+    """Analisa o ativo usando apenas o módulo 'fundamental' (compatível com plano gratuito)."""
     try:
-        url = f"https://brapi.dev/api/quote/{ticker}?modules=balanceSheetHistory&fundamental=true&range=1mo&interval=1d"
+        # Otimizado para plano gratuito: removido 'balanceSheetHistory' que causa erro 403
+        url = f"https://brapi.dev/api/quote/{ticker}?fundamental=true&range=1mo&interval=1d"
         response = fetch_data(url, token)
         
+        if response.status_code == 403:
+            return {"Ativo": ticker, "Status": "Erro 403: Plano não permite este dado", "Setor": "N/A"}
         if response.status_code == 401:
             return {"Ativo": ticker, "Status": "Erro 401: Token Inválido", "Setor": "N/A"}
             
@@ -77,26 +76,13 @@ def analisar_ativo(ticker, criterios, tipo_ativo, token):
                 res["Status"] = "Dados Insuficientes"
                 return res
 
-            peg_ratio = None
-            if "balanceSheetHistory" in data and "balanceSheetStatements" in data["balanceSheetHistory"]:
-                historico_lpa = [b["eps"]["raw"] for b in data["balanceSheetHistory"]["balanceSheetStatements"] if b.get("periodType") == "ANNUAL" and b.get("eps")]
-                if len(historico_lpa) >= 2:
-                    historico_lpa.reverse()
-                    crescimento_lpa = calcular_cagr(historico_lpa[0], historico_lpa[-1], len(historico_lpa) - 1)
-                    if crescimento_lpa and crescimento_lpa > 0:
-                        peg_ratio = p_l / (crescimento_lpa * 100)
-
+            # Análise baseada nos critérios disponíveis no plano gratuito
             passou = (p_l <= criterios["P/L_MAX"]) and (p_vp <= criterios["P/VP_MAX"]) and \
                      (roe is not None and roe >= criterios["ROE_MIN"]) and \
                      (roic is not None and roic >= criterios["ROIC_MIN"])
             
-            if passou and peg_ratio is not None:
-                is_alto = any(s in setor for s in ["Tecnologia", "Varejo", "Consumo"])
-                if is_alto and peg_ratio > criterios["PEG_MAX_ALTO"]: passou = False
-                elif not is_alto and not (criterios["PEG_MIN_BAIXO"] <= peg_ratio <= criterios["PEG_MAX_BAIXO"]): passou = False
-            
             res["Status"] = "Aprovada ✅" if passou else "Reprovada ❌"
-            res.update({"P/L": p_l, "P/VP": p_vp, "ROE (%)": roe, "ROIC (%)": roic, "PEG Ratio": peg_ratio})
+            res.update({"P/L": p_l, "P/VP": p_vp, "ROE (%)": roe, "ROIC (%)": roic})
             
         elif tipo_ativo == 'fund':
             p_vp = data.get("priceToBook")
@@ -137,9 +123,6 @@ if tipo_sel == "stock":
     crit["P/VP_MAX"] = st.sidebar.number_input("P/VP Máximo", 1.2)
     crit["ROE_MIN"] = st.sidebar.number_input("ROE Mínimo (%)", 15.0)
     crit["ROIC_MIN"] = st.sidebar.number_input("ROIC Mínimo (%)", 15.0)
-    crit["PEG_MIN_BAIXO"] = st.sidebar.number_input("PEG Mín. (Baixo)", 0.5)
-    crit["PEG_MAX_BAIXO"] = st.sidebar.number_input("PEG Máx. (Baixo)", 1.0)
-    crit["PEG_MAX_ALTO"] = st.sidebar.number_input("PEG Máx. (Alto)", 3.0)
 else:
     crit["P/VP_MAX_FII"] = st.sidebar.number_input("P/VP Máximo", 1.0)
     crit["DY_MIN_FII"] = st.sidebar.number_input("DY Mínimo (%)", 8.0)
@@ -160,7 +143,7 @@ if st.button("▶️ Iniciar Análise"):
         df_res = pd.DataFrame(res_list)
         st.subheader("Resultados")
         cols = ["Ativo", "Nome", "Setor", "Status", "P/VP"]
-        if tipo_sel == "stock": cols += ["P/L", "ROE (%)", "ROIC (%)", "PEG Ratio"]
+        if tipo_sel == "stock": cols += ["P/L", "ROE (%)", "ROIC (%)"]
         else: cols += ["Dividend Yield (%)"]
         
         st.dataframe(df_res[[c for c in cols if c in df_res.columns]].style.format(precision=2, na_rep="-"), use_container_width=True)
