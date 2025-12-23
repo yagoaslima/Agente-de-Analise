@@ -8,11 +8,19 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="Agente de Análise B3", layout="wide")
 
+def fetch_data(url, token=None):
+    """Realiza a requisição adicionando o token se disponível."""
+    if token:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}token={token}"
+    return requests.get(url)
+
 @st.cache_data(ttl=3600)
-def get_all_market_data():
+def get_all_market_data(token=None):
     """Busca a lista de ativos disponíveis na B3."""
     try:
-        response = requests.get("https://brapi.dev/api/quote/list")
+        url = "https://brapi.dev/api/quote/list"
+        response = fetch_data(url, token)
         response.raise_for_status()
         data = response.json().get('stocks', [])
         df = pd.DataFrame(data)
@@ -23,22 +31,33 @@ def get_all_market_data():
     except Exception:
         return pd.DataFrame(columns=['stock', 'name', 'sector', 'type'])
 
-MARKET_DATA_DF = get_all_market_data()
+# --- SIDEBAR: TOKEN ---
+st.sidebar.header("🔑 Autenticação")
+api_token = st.sidebar.text_input("Brapi API Token", type="password", help="Obtenha seu token gratuito em brapi.dev")
+
+# Carregamento inicial
+MARKET_DATA_DF = get_all_market_data(api_token)
 
 if MARKET_DATA_DF.empty:
-    st.error("⚠️ Erro ao carregar dados da B3. Tente recarregar a página.")
+    if not api_token:
+        st.warning("👉 Insira seu **API Token** da Brapi na barra lateral para começar. [brapi.dev](https://brapi.dev)")
+    else:
+        st.error("⚠️ Erro ao carregar dados. Verifique seu Token.")
     st.stop()
 
 def calcular_cagr(valor_inicial, valor_final, periodos):
     if valor_inicial is None or valor_final is None or valor_inicial <= 0 or periodos <= 0: return None
     return ((valor_final / valor_inicial) ** (1 / periodos)) - 1
 
-def analisar_ativo(ticker, criterios, tipo_ativo):
-    """Analisa o ativo buscando apenas dados atuais (mais leve e estável)."""
+def analisar_ativo(ticker, criterios, tipo_ativo, token):
+    """Analisa o ativo usando o token para evitar erro 401."""
     try:
-        # Chamada leve: apenas fundamentalista e histórico curto (1 mês) para o gráfico
         url = f"https://brapi.dev/api/quote/{ticker}?modules=balanceSheetHistory&fundamental=true&range=1mo&interval=1d"
-        response = requests.get(url)
+        response = fetch_data(url, token)
+        
+        if response.status_code == 401:
+            return {"Ativo": ticker, "Status": "Erro 401: Token Inválido", "Setor": "N/A"}
+            
         response.raise_for_status()
         data = response.json()["results"][0]
         
@@ -126,14 +145,17 @@ else:
     crit["DY_MIN_FII"] = st.sidebar.number_input("DY Mínimo (%)", 8.0)
 
 if st.button("▶️ Iniciar Análise"):
-    if not acoes_sel: st.warning("Selecione ativos.")
+    if not api_token:
+        st.error("❌ Por favor, insira seu API Token na barra lateral.")
+    elif not acoes_sel:
+        st.warning("Selecione ativos.")
     else:
         res_list = []
         bar = st.progress(0)
         for i, t in enumerate(acoes_sel):
-            res_list.append(analisar_ativo(t, crit, tipo_sel))
+            res_list.append(analisar_ativo(t, crit, tipo_sel, api_token))
             bar.progress((i + 1) / len(acoes_sel))
-            time.sleep(0.1)
+            time.sleep(0.2)
         
         df_res = pd.DataFrame(res_list)
         st.subheader("Resultados")
